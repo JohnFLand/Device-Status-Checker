@@ -54,6 +54,7 @@ definition(
     category:    "Convenience",
     iconUrl:     '',
     iconX2Url:   '',
+    importUrl: "https://raw.githubusercontent.com/JohnFLand/Device-Status-Checker/refs/heads/main/Device_Status_Checker.groovy",
     singleInstance: true,
     oauth:          true
 )
