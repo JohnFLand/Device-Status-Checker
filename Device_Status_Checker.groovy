@@ -23,6 +23,30 @@
  *          /device/disable
  *    - Hubitat's internal endpoints are not formal public APIs and may change.
  *
+ *  v1.20 — Fix duplicate scan messages: cached results are kept visible during
+ *          a re-scan; buildReportHtml returns "" (not a second message) when a
+ *          first scan is in progress — "Scan started" in button section suffices
+ *  v1.19 — Proper async scan: asynchttpGet chains through devices one by one
+ *          (same pattern as Rule Logging app); "Scan started" message shows
+ *          immediately on button press; page polls every 5 s until done;
+ *          5-minute timeout safety net saves partial results
+ *  v1.18 — Fix persistent "Scan started" message: replaced state.scanStatus with
+ *          a one-shot state.showScanStatus flag consumed in mainPage so the message
+ *          appears exactly once (on the post-scan render) and never persists
+ *  v1.17 — Reverted async scan (runIn broke hub HTTP calls); scan is synchronous
+ *          again; "Scan started" message reliably shown in same section as button
+ *          above results; stale message cleared on non-scan page opens
+ *  v1.16 — Device count shown in "Device Selection" section header; scan made
+ *          truly async (appButtonHandler schedules performScan via runIn so the
+ *          "Scan started" message is visible before results arrive); page polls
+ *          every 5 s while scan is in progress
+ *  v1.15 — "Scan started: timestamp — scanning N devices…" status line shown
+ *          under the Scan button while scanning; cleared when table renders
+ *  v1.14 — On-demand scan: opening the app shows cached results immediately;
+ *          "Rescan Devices" renamed to "Scan Devices"; scan only runs on button click
+ *  v1.13 — Device Label: Device Name column now shows the device label (user-assigned
+ *          name) with fallback to display name then driver name; column header renamed
+ *          to "Device Label". Hide Disabled column button added to the column-hide bar.
  *  v1.12 — Logging column: reads driver bool preferences whose name contains
  *          "debug", "log", "trace", "verbose", or "txt" from /device/fullJson
  *          settings[]; shows each as name ✓/✗; sorts by count of enabled prefs;
@@ -33,8 +57,7 @@
  *  v1.10 — App instance name field; printable HTML report and CSV export via OAuth
  *          endpoints; scan rows cached in state so report/CSV never need a rescan
  *  v1.9 — Name filter field (wildcard * and ?); Hide Rows button for disabled
- *         devices; Rescan Devices button below Devices section; Device Type
- *         column left-justified
+ *         devices; Scan Devices button; Device Type column left-justified
  *  v1.8 — Removed Source/Notes column; sortable columns; persistent column-hide
  *         toggle bar (localStorage); Disabled cells clickable to toggle state;
  *         gold header row matching Rule Logging Status Checker; removed Diagnostics
@@ -44,10 +67,18 @@
 
 import groovy.transform.Field
 
-@Field static final String HUB_BASE_URL = "http://127.0.0.1:8080"
+@Field static final String HUB_BASE_URL       = "http://127.0.0.1:8080"
+@Field static final int    SCAN_TIMEOUT_SECS  = 300   // 5-minute safety net
+
+// Transient scan state — lives in JVM memory during the async chain.
+// Not persisted; safe to lose on hub restart (finalizeScanTimeout cleans up state[]).
+@Field static List<Map>        scanDeviceQueue    = []
+@Field static Map<String, Map> scanPartialResults = [:]
+@Field static volatile String  currentScanId      = null
+@Field static volatile Long    scanStartMs        = 0L
 
 definition(
-    name:        "Device Status Checker 1.12",
+    name:        "Device Status Checker 1.20",
     namespace:   "johnland",
     author:      "John Land & AI",
     description: "Report for selected devices for disabled status and history retention settings.",
@@ -91,9 +122,162 @@ void logsOff() {
 }
 
 void appButtonHandler(String btn) {
-    // "btnRescan" just needs the page to re-render — buildReportHtml() runs fresh
-    // on every mainPage() call, so the page refresh triggered here is the rescan.
+    if (btn == "btnScan") startScan()
     if (debugEnable) log.debug "appButtonHandler: ${btn}"
+}
+
+private void startScan() {
+    List devs = normalizeDeviceList(selectedDevices)
+    if (!devs) return
+
+    unschedule("finalizeScanTimeout")
+
+    Long   nowMs     = now()
+    String scanId    = nowMs.toString()
+    String startTime = new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+
+    // Pre-collect everything that doesn't need an HTTP call while we still
+    // have the DeviceWrapper objects (they aren't available in async callbacks).
+    List<Map> queue = devs.sort { a, b ->
+        safeString(getDeviceName(a)) <=> safeString(getDeviceName(b))
+    }.collect { dev ->
+        [
+            id      : safeString(getDeviceId(dev)),
+            name    : safeString(getDeviceName(dev)),
+            type    : safeString(getDeviceType(dev)),
+            disabled: getDisabledStatus(dev),
+            direct  : getRetentionValuesDirectly(dev)
+        ]
+    }
+
+    scanDeviceQueue    = queue
+    scanPartialResults = [:]
+    currentScanId      = scanId
+    scanStartMs        = nowMs
+
+    state.scanStatus     = "<i>Scan started: ${startTime} — scanning ${queue.size()} device${queue.size() == 1 ? '' : 's'}…</i>"
+    state.scanInProgress = true
+
+    log.info "Device Status Checker: scan started — ${queue.size()} devices (scanId: ${scanId})"
+    runIn(SCAN_TIMEOUT_SECS, "finalizeScanTimeout")
+
+    asynchttpGet("handleFullJsonResponse",
+        [uri: HUB_BASE_URL, path: "/device/fullJson/${queue[0].id}", timeout: 30],
+        [scanId: scanId, idx: 0])
+}
+
+// asynchttpGet callback — must be non-private so the platform can invoke it.
+def handleFullJsonResponse(resp, Map passData) {
+    String scanId = passData?.scanId as String
+    int    idx    = (passData?.idx ?: 0) as int
+
+    if (currentScanId != scanId) {
+        if (debugEnable) log.debug "handleFullJsonResponse: ignoring stale callback (scanId ${scanId})"
+        return
+    }
+
+    Map    qEntry   = scanDeviceQueue[idx]
+    String deviceId = qEntry?.id as String
+
+    Map jsonValues = [:]
+    try {
+        if (!resp.hasError() && resp.status == 200) {
+            String body = resp.data
+            if (body) {
+                jsonValues = parseDeviceFullJson(new groovy.json.JsonSlurper().parseText(body))
+            }
+        } else if (debugEnable) {
+            log.debug "handleFullJsonResponse: device ${deviceId} — HTTP ${resp.status} ${resp.errorMessage ?: ''}"
+        }
+    } catch (Exception e) {
+        if (debugEnable) log.debug "handleFullJsonResponse: device ${deviceId} — ${e.message}"
+    }
+
+    Map direct = (qEntry?.direct instanceof Map) ? (Map) qEntry.direct : [:]
+    scanPartialResults[deviceId] = [
+        id                    : qEntry?.id       ?: "unknown",
+        name                  : qEntry?.name     ?: "unknown",
+        type                  : qEntry?.type     ?: "unknown",
+        disabled              : qEntry?.disabled,
+        meshEnabled           : jsonValues.meshEnabled,
+        meshAvailable         : jsonValues.meshSelectionEnabled,
+        retryEnabled          : jsonValues.retryEnabled,
+        retryAvailable        : jsonValues.retryAvailable,
+        loggingSettings       : jsonValues.loggingSettings ?: [],
+        eventHistorySize      : firstUseful(direct.eventHistorySize,       jsonValues.eventHistorySize,       "unknown"),
+        stateHistorySize      : firstUseful(direct.stateHistorySize,       jsonValues.stateHistorySize,       "unknown"),
+        tooManyEventsThreshold: firstUseful(direct.tooManyEventsThreshold, jsonValues.tooManyEventsThreshold, "unknown")
+    ]
+
+    int nextIdx = idx + 1
+    if (nextIdx < scanDeviceQueue.size()) {
+        Map next = scanDeviceQueue[nextIdx]
+        asynchttpGet("handleFullJsonResponse",
+            [uri: HUB_BASE_URL, path: "/device/fullJson/${next.id}", timeout: 30],
+            [scanId: scanId, idx: nextIdx])
+    } else {
+        finalizeScan(scanId)
+    }
+}
+
+private void finalizeScan(String scanId) {
+    if (currentScanId != scanId) return
+    unschedule("finalizeScanTimeout")
+
+    Long   elapsed  = (now() as Long) - scanStartMs
+    String duration = formatScanDuration(elapsed)
+    String scanTime = nowString()
+
+    List<Map> rows = scanDeviceQueue.collect { Map q ->
+        scanPartialResults[q.id as String] ?: [
+            id: q.id ?: "unknown", name: q.name ?: "unknown", type: q.type ?: "unknown",
+            disabled: q.disabled, meshEnabled: null, meshAvailable: null,
+            retryEnabled: null, retryAvailable: null, loggingSettings: [],
+            eventHistorySize      : q.direct?.eventHistorySize       ?: "unknown",
+            stateHistorySize      : q.direct?.stateHistorySize       ?: "unknown",
+            tooManyEventsThreshold: q.direct?.tooManyEventsThreshold ?: "unknown"
+        ]
+    }
+
+    try {
+        state.scanRowsJson     = groovy.json.JsonOutput.toJson(rows)
+        state.lastScan         = scanTime
+        state.lastScanDuration = duration
+    } catch (Exception e) {
+        if (debugEnable) log.debug "finalizeScan: could not cache rows — ${e.message}"
+    }
+
+    currentScanId        = null
+    state.scanStatus     = null
+    state.scanInProgress = false
+
+    log.info "Device Status Checker: scan completed — ${rows.size()} devices in ${duration}"
+}
+
+// Safety net in case the async chain stalls (hub restart, HTTP failure, etc.)
+void finalizeScanTimeout() {
+    if (!currentScanId) return
+    log.warn "Device Status Checker: scan timed out after ${SCAN_TIMEOUT_SECS}s — saving partial results"
+
+    List<Map> rows = scanDeviceQueue.collect { Map q ->
+        scanPartialResults[q.id as String] ?: [
+            id: q.id ?: "unknown", name: q.name ?: "unknown", type: q.type ?: "unknown",
+            disabled: q.disabled, meshEnabled: null, meshAvailable: null,
+            retryEnabled: null, retryAvailable: null, loggingSettings: [],
+            eventHistorySize      : q.direct?.eventHistorySize       ?: "unknown",
+            stateHistorySize      : q.direct?.stateHistorySize       ?: "unknown",
+            tooManyEventsThreshold: q.direct?.tooManyEventsThreshold ?: "unknown"
+        ]
+    }
+    try {
+        state.scanRowsJson     = groovy.json.JsonOutput.toJson(rows)
+        state.lastScan         = nowString()
+        state.lastScanDuration = "timed out"
+    } catch (Exception e) { }
+
+    currentScanId        = null
+    state.scanStatus     = null
+    state.scanInProgress = false
 }
 
 // ============================================================
@@ -188,7 +372,7 @@ private String buildPrintHtml() {
 
     StringBuilder sb = new StringBuilder()
     sb << "<table><thead><tr>"
-    ["Device ID","Device Name","Device Type","Disabled","Hub Mesh","Cmd Retry","Event Hist Size","State Hist Size","Alert Threshold","Logging"].each {
+    ["Device ID","Device Label","Device Type","Disabled","Hub Mesh","Cmd Retry","Event Hist Size","State Hist Size","Alert Threshold","Logging"].each {
         sb << "<th>${htmlEscape(it)}</th>"
     }
     sb << "</tr></thead><tbody>"
@@ -243,7 +427,7 @@ private String buildCsv() {
     rows = rows.sort { it.name?.toString()?.toLowerCase() ?: "" }
 
     StringBuilder sb = new StringBuilder()
-    sb << "Device ID,Device Name,Device Type,Disabled,Hub Mesh,Cmd Retry,Event Hist Size,State Hist Size,Alert Threshold,Logging\n"
+    sb << "Device ID,Device Label,Device Type,Disabled,Hub Mesh,Cmd Retry,Event Hist Size,State Hist Size,Alert Threshold,Logging\n"
     rows.each { Map r ->
         String meshVal  = (r.meshAvailable  == true) ? ((r.meshEnabled  == true) ? "On" : "Off") : "—"
         String retryVal = (r.retryAvailable == true) ? ((r.retryEnabled == true) ? "On" : "Off") : "—"
@@ -273,9 +457,15 @@ private String escapeCsv(Object val) {
 
 def mainPage() {
     checkOAuth()
-    dynamicPage(name: "mainPage", title: "<b>${app.name}</b>", install: true, uninstall: true) {
+    int pollInterval = currentScanId ? 5 : 0
+    dynamicPage(name: "mainPage", title: "<b>${app.name}</b>", install: true, uninstall: true, refreshInterval: pollInterval) {
 
-        section("Device Selection", hideable: true, hidden: true) {
+        int devCount = normalizeDeviceList(selectedDevices)?.size() ?: 0
+        String devSectionTitle = devCount
+            ? "Device Selection (${devCount} device${devCount == 1 ? '' : 's'} selected)"
+            : "Device Selection"
+
+        section(devSectionTitle, hideable: true, hidden: true) {
             input(
                 name           : "selectedDevices",
                 type           : "capability.*",
@@ -287,7 +477,10 @@ def mainPage() {
         }
 
         section("") {
-            input "btnRescan", "button", title: "Rescan Devices"
+            input "btnScan", "button", title: "Scan Devices"
+            if (state.scanStatus) {
+                paragraph state.scanStatus
+            }
         }
 
         section("") {
@@ -308,7 +501,7 @@ def mainPage() {
                         " &nbsp;|&nbsp; " +
                         "<a href='${csvUrl}'>&#11015; Download CSV</a>"
                 } else {
-                    paragraph "<small>Click <b>Rescan Devices</b> to enable the report and CSV export.</small>"
+                    paragraph "<small>Click <b>Scan Devices</b> to enable the report and CSV export.</small>"
                 }
             } else {
                 paragraph "<small>OAuth setup required before reports are available. " +
@@ -334,9 +527,9 @@ def mainPage() {
                 "Direct DeviceWrapper checks run first for Event History Size, State History Size, " +
                 "and Too Many Events Alert Threshold. Any values not available directly are read " +
                 "from <code>${HUB_BASE_URL}/device/fullJson/{deviceId}</code>.<br><br>" +
-                "<b>Rescan</b><br>" +
-                "Click <b>Rescan Devices</b> to re-run the audit. The report is also rebuilt " +
-                "automatically whenever the page is opened or the Devices list is changed.<br><br>" +
+                "<b>Scan</b><br>" +
+                "Click <b>Scan Devices</b> to run or re-run the audit. Opening the app does not " +
+                "trigger a new scan — cached results from the previous scan are shown instead.<br><br>" +
                 "<b>Printable report and CSV export</b><br>" +
                 "Links appear in the <b>Controls</b> section after the first scan. The printable " +
                 "report opens in a new browser tab. The CSV download is named DeviceState.csv. " +
@@ -386,18 +579,19 @@ private String buildReportHtml() {
         return "<p>Select one or more devices above.</p>"
     }
 
-    Long scanStart = now() as Long
-
-    List<Map> rows = []
-    devs.sort { a, b ->
-        safeString(getDeviceName(a)) <=> safeString(getDeviceName(b))
-    }.each { dev ->
-        rows << auditDevice(dev)
+    if (state.scanRowsJson) {
+        List<Map> rows = []
+        try { rows = new groovy.json.JsonSlurper().parseText(state.scanRowsJson) as List<Map> } catch (Exception e) {}
+        return buildTableHtml(rows, state.lastScan ?: "unknown", state.lastScanDuration ?: "")
     }
 
-    Long scanMs = (now() as Long) - scanStart
-    String duration = formatScanDuration(scanMs)
+    if (state.scanInProgress) return ""   // "Scan started" in button section is enough
 
+    return "<p>No scan results yet. Click <b>Scan Devices</b> above to run the first scan.</p>"
+}
+
+/* Renders the summary line, filter/hide bar, and data table. */
+private String buildTableHtml(List<Map> rows, String lastScan, String duration) {
     StringBuilder sb = new StringBuilder()
 
     // ── CSS + JS ──────────────────────────────────────────────────────────────
@@ -406,7 +600,10 @@ private String buildReportHtml() {
     // ── Summary line ──────────────────────────────────────────────────────────
     sb << "<div style='margin-bottom:28px;'>"
     sb << "<b>Devices scanned:</b> ${rows.size()}&emsp;"
-    sb << "<b>Last scan:</b> ${htmlEscape(nowString())} (Scan time: ${duration})"
+    sb << "<b>Last scan:</b> ${htmlEscape(lastScan)}"
+    if (duration) {
+        sb << " (Scan time: ${htmlEscape(duration)})"
+    }
     sb << "</div>"
 
     // ── Column hide toggle bar + row filter + name filter ─────────────────────
@@ -415,6 +612,7 @@ private String buildReportHtml() {
     sb << "<span id='dsc-toggle-row-disabled' class='rmcol-btn' data-pref-key='dsc-rowfilt-disabled' onclick='dscToggleRowFilter(this)'>Disabled devices</span>"
     sb << "&nbsp;&nbsp;<b>Hide columns:</b>&nbsp;"
     sb << "<span class='rmcol-btn' data-pref-key='dsc-devid'     data-col-class='dsc-col-devid'     onclick=\"dscToggleCol('dsc-col-devid',this)\">Device ID</span>"
+    sb << "<span class='rmcol-btn' data-pref-key='dsc-disabled'  data-col-class='dsc-col-disabled'  onclick=\"dscToggleCol('dsc-col-disabled',this)\">Disabled</span>"
     sb << "<span class='rmcol-btn' data-pref-key='dsc-devtype'   data-col-class='dsc-col-devtype'   onclick=\"dscToggleCol('dsc-col-devtype',this)\">Device Type</span>"
     sb << "<span class='rmcol-btn' data-pref-key='dsc-evtsize'   data-col-class='dsc-col-evtsize'   onclick=\"dscToggleCol('dsc-col-evtsize',this)\">Event Hist Size</span>"
     sb << "<span class='rmcol-btn' data-pref-key='dsc-statesize' data-col-class='dsc-col-statesize' onclick=\"dscToggleCol('dsc-col-statesize',this)\">State Hist Size</span>"
@@ -429,9 +627,9 @@ private String buildReportHtml() {
     // ── Table ─────────────────────────────────────────────────────────────────
     sb << "<table id='dsc_table' class='rmlogcheck'><thead><tr>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',0)\" class='center dsc-col-devid'>Device ID</th>"
-    sb << "<th onclick=\"sortRmLogTable('dsc_table',1)\" class='sort-asc'>Device Name</th>"
+    sb << "<th onclick=\"sortRmLogTable('dsc_table',1)\" class='sort-asc'>Device Label</th>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',2)\" class='dsc-col-devtype'>Device Type</th>"
-    sb << "<th onclick=\"sortRmLogTable('dsc_table',3)\" class='center'>Disabled</th>"
+    sb << "<th onclick=\"sortRmLogTable('dsc_table',3)\" class='center dsc-col-disabled'>Disabled</th>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',4)\" class='center dsc-col-mesh'>Hub Mesh</th>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',5)\" class='center dsc-col-retry'>Cmd Retry</th>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',6)\" class='center dsc-col-evtsize'>Event Hist Size</th>"
@@ -452,7 +650,7 @@ private String buildReportHtml() {
             ? "<span style='color:red;font-weight:bold;'>Yes</span>"
             : "<span style='color:green;font-weight:bold;'>No</span>"
 
-        // Build device name cell with link
+        // Build device label cell with link
         String sid = safeString(r.id)
         String nameLinkHtml
         if (sid && sid != "unknown") {
@@ -466,7 +664,7 @@ private String buildReportHtml() {
         sb << "<td class='center dsc-col-devid' data-sort='${id}'>${id}</td>"
         sb << "<td data-sort='${nameEsc}'>${nameLinkHtml}</td>"
         sb << "<td class='dsc-col-devtype' data-sort='${typeEsc}'>${typeEsc}</td>"
-        sb << "<td class='center rmlog-clickable' data-sort='${isDisabled ? "1" : "0"}' data-device-id='${id}' data-on='${isDisabled}' onclick='devToggleDisabled(this)'>${disabledFmt}</td>"
+        sb << "<td class='center rmlog-clickable dsc-col-disabled' data-sort='${isDisabled ? "1" : "0"}' data-device-id='${id}' data-on='${isDisabled}' onclick='devToggleDisabled(this)'>${disabledFmt}</td>"
 
         // Hub Mesh cell
         if (r.meshAvailable == true) {
@@ -515,16 +713,9 @@ private String buildReportHtml() {
     // Restore any previously saved column-hide preferences from localStorage
     sb << "<script>dscLoadPrefs();</script>"
 
-    // Cache rows so the OAuth report/CSV endpoints can serve without a rescan
-    try {
-        state.scanRowsJson = groovy.json.JsonOutput.toJson(rows)
-        state.lastScan     = nowString()
-    } catch (Exception e) {
-        if (debugEnable) log.debug "buildReportHtml: could not cache scan rows — ${e.message}"
-    }
-
     return sb.toString()
 }
+
 
 /* --------------------------------------------------------------------------
  * CSS and JavaScript for the report table
@@ -846,10 +1037,12 @@ private Object getDeviceId(dev) {
 
 private Object getDeviceName(dev) {
     return firstUseful(
-        tryMethod(dev, "getName"),
-        tryProperty(dev, "name"),
+        tryMethod(dev, "getLabel"),
+        tryProperty(dev, "label"),
         tryMethod(dev, "getDisplayName"),
-        tryProperty(dev, "displayName")
+        tryProperty(dev, "displayName"),
+        tryMethod(dev, "getName"),
+        tryProperty(dev, "name")
     )
 }
 
