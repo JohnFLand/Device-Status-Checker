@@ -3,7 +3,7 @@
 A Hubitat app that audits selected devices and presents their key settings in a sortable, filterable table. Useful for reviewing device configuration across your entire device list at a glance.
 
 
-
+![Device Status Checker screenshot](Screenshot%202026-05-08%20153422.png)
 ---
 
 ## Installation
