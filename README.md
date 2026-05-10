@@ -2,13 +2,13 @@
 
 A Hubitat app that audits selected devices and presents their key settings in a sortable, filterable table. Useful for reviewing device configuration across your entire device list at a glance.
 
+![Device Status Checker screenshot](Screenshot%202026-05-08%20153422.png)
 
-![Device Status Checker screenshot](Screenshot%202026-05-08%2053422.png
 ---
 
 ## Installation
 
-1. In Hubitat, go to **Apps Code → + New App** and paste in the contents of `Device_Status_Checker_1_12.groovy`.
+1. In Hubitat, go to **Apps Code → + New App** and paste in the contents of `Device_Status_Checker_1_13.groovy`.
 2. Save. OAuth will be enabled automatically on first use.
 3. Go to **Apps → + Add User App** and select **Device Status Checker**.
 4. Expand the **Device Selection** section and choose the devices you want to audit.
@@ -20,11 +20,11 @@ A Hubitat app that audits selected devices and presents their key settings in a 
 | Column | Description |
 |---|---|
 | **Device ID** | Internal Hubitat device ID; links to the device edit page |
-| **Device Name** | Device label |
+| **Device Label** | Device label |
 | **Device Type** | Driver name |
 | **Disabled** | Whether the device is disabled — click to toggle |
-| **Hub Mesh** | Whether Hub Mesh is enabled for this device — click to toggle (shows `—` for devices that do not support it) |
-| **Command Retry** | Whether Command Retry is enabled — click to toggle (shows `—` for devices that do not support it) |
+| **Hub Mesh** | Whether Hub Mesh is enabled for this device — click to toggle (shows "`—`" for devices that do not support it) |
+| **Command Retry** | Whether Command Retry is enabled — click to toggle (shows "`—`" for devices that do not support it) |
 | **Event History Size** | Maximum number of events retained for this device |
 | **State History Size** | Maximum number of states retained for this device |
 | **Events Alert Threshold** | "Too many events" alert threshold |
@@ -35,7 +35,7 @@ A Hubitat app that audits selected devices and presents their key settings in a 
 ## Features
 
 ### Sorting
-Click any column header to sort by that column; click again to reverse direction. The default sort is by Device Name. Numeric columns (Device ID, history sizes, alert threshold) sort numerically. The Logging column sorts by count of enabled logging preferences.
+Click any column header to sort by that column; click again to reverse direction. The default sort is by Device Label. Numeric columns (Device ID, history sizes, alert threshold) sort numerically. The Logging column sorts by count of enabled logging preferences.
 
 ### Filtering and hiding rows
 - The **Filter** field at the top right of the table accepts wildcard patterns: `*` matches any sequence of characters, `?` matches any single character (e.g. `*Motion*`). Filtering is case-insensitive.
@@ -93,6 +93,7 @@ This app uses several Hubitat internal endpoints that are not part of a formal p
 
 | Version | Changes |
 |---|---|
+| 1.13 | Device Name column renamed to Device Label; `getDeviceName()` now resolves the user-assigned label first, falling back to display name then driver name. Hide Disabled column button added to the column-hide bar |
 | 1.12 | Logging column: reads driver bool preferences from `settings[]` in `/device/fullJson`; shows each as name ✓/✗; sorts by count of enabled prefs |
 | 1.11 | Hub Mesh and Command Retry columns with in-place toggle via `POST /device/update` |
 | 1.10 | App instance name field; printable HTML report and CSV export via OAuth endpoints |
