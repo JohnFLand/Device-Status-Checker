@@ -5,14 +5,15 @@
  *    - User selects devices using capability.*
  *    - Reports:
  *        Device ID
- *        Device Name
+ *        Device Label
  *        Device Type
  *        Disabled status (clickable to toggle)
- *        Hub Mesh status (On/Off. clickable to toggle)
+ *        Hub Mesh status (On/Off, clickable to toggle)
  *        Command Retry status (On/Off for devices supporting the function, clickable to toggle)
  *        Event history size
  *        State history size
  *        Too many events alert threshold
+ *        Logging preferences (bool driver prefs whose name contains debug/log/trace/verbose/txt)
  *
  *  Notes:
  *    - Event/state/threshold fields are not documented DeviceWrapper getters.
@@ -21,48 +22,11 @@
  *          /device/fullJson/{deviceId}
  *    - The Disabled cell toggle uses Hubitat's internal endpoint:
  *          /device/disable
+ *    - Hub Mesh and Command Retry toggles use a read-then-write pattern via:
+ *          GET /device/fullJson/{deviceId}  then  POST /device/update
  *    - Hubitat's internal endpoints are not formal public APIs and may change.
  *
- *  v1.20 — Fix duplicate scan messages: cached results are kept visible during
- *          a re-scan; buildReportHtml returns "" (not a second message) when a
- *          first scan is in progress — "Scan started" in button section suffices
- *  v1.19 — Proper async scan: asynchttpGet chains through devices one by one
- *          (same pattern as Rule Logging app); "Scan started" message shows
- *          immediately on button press; page polls every 5 s until done;
- *          5-minute timeout safety net saves partial results
- *  v1.18 — Fix persistent "Scan started" message: replaced state.scanStatus with
- *          a one-shot state.showScanStatus flag consumed in mainPage so the message
- *          appears exactly once (on the post-scan render) and never persists
- *  v1.17 — Reverted async scan (runIn broke hub HTTP calls); scan is synchronous
- *          again; "Scan started" message reliably shown in same section as button
- *          above results; stale message cleared on non-scan page opens
- *  v1.16 — Device count shown in "Device Selection" section header; scan made
- *          truly async (appButtonHandler schedules performScan via runIn so the
- *          "Scan started" message is visible before results arrive); page polls
- *          every 5 s while scan is in progress
- *  v1.15 — "Scan started: timestamp — scanning N devices…" status line shown
- *          under the Scan button while scanning; cleared when table renders
- *  v1.14 — On-demand scan: opening the app shows cached results immediately;
- *          "Rescan Devices" renamed to "Scan Devices"; scan only runs on button click
- *  v1.13 — Device Label: Device Name column now shows the device label (user-assigned
- *          name) with fallback to display name then driver name; column header renamed
- *          to "Device Label". Hide Disabled column button added to the column-hide bar.
- *  v1.12 — Logging column: reads driver bool preferences whose name contains
- *          "debug", "log", "trace", "verbose", or "txt" from /device/fullJson
- *          settings[]; shows each as name ✓/✗; sorts by count of enabled prefs;
- *          shows — for devices with no matching preferences
- *  v1.11 — Hub Mesh and Command Retry columns: read from /device/fullJson and
- *          toggle via POST /device/update (read-version-then-resubmit pattern);
- *          cells show — for devices where the feature is not available
- *  v1.10 — App instance name field; printable HTML report and CSV export via OAuth
- *          endpoints; scan rows cached in state so report/CSV never need a rescan
- *  v1.9 — Name filter field (wildcard * and ?); Hide Rows button for disabled
- *         devices; Scan Devices button; Device Type column left-justified
- *  v1.8 — Removed Source/Notes column; sortable columns; persistent column-hide
- *         toggle bar (localStorage); Disabled cells clickable to toggle state;
- *         gold header row matching Rule Logging Status Checker; removed Diagnostics
- *         section; Notes section moved to end; scan duration added to Last scan
- *         line; Enable debug logging toggle added at bottom
+ *  See README.md for full version history.
  */
 
 import groovy.transform.Field
@@ -78,8 +42,8 @@ import groovy.transform.Field
 @Field static volatile Long    scanStartMs        = 0L
 
 definition(
-    name:        "Device Status Checker 1.20",
-    namespace:   "johnland",
+    name:        "Device Status Checker 1.21",
+    namespace:   "John Land",
     author:      "John Land & AI",
     description: "Report for selected devices for disabled status and history retention settings.",
     category:    "Convenience",
@@ -220,6 +184,25 @@ def handleFullJsonResponse(resp, Map passData) {
     }
 }
 
+// Returns a fully-populated row map for a queue entry that received no HTTP response.
+// Used by both finalizeScan() and finalizeScanTimeout() to avoid duplicating the literal.
+private Map fallbackRow(Map q) {
+    [
+        id                    : q.id    ?: "unknown",
+        name                  : q.name  ?: "unknown",
+        type                  : q.type  ?: "unknown",
+        disabled              : q.disabled,
+        meshEnabled           : null,
+        meshAvailable         : null,
+        retryEnabled          : null,
+        retryAvailable        : null,
+        loggingSettings       : [],
+        eventHistorySize      : q.direct?.eventHistorySize       ?: "unknown",
+        stateHistorySize      : q.direct?.stateHistorySize       ?: "unknown",
+        tooManyEventsThreshold: q.direct?.tooManyEventsThreshold ?: "unknown"
+    ]
+}
+
 private void finalizeScan(String scanId) {
     if (currentScanId != scanId) return
     unschedule("finalizeScanTimeout")
@@ -229,14 +212,7 @@ private void finalizeScan(String scanId) {
     String scanTime = nowString()
 
     List<Map> rows = scanDeviceQueue.collect { Map q ->
-        scanPartialResults[q.id as String] ?: [
-            id: q.id ?: "unknown", name: q.name ?: "unknown", type: q.type ?: "unknown",
-            disabled: q.disabled, meshEnabled: null, meshAvailable: null,
-            retryEnabled: null, retryAvailable: null, loggingSettings: [],
-            eventHistorySize      : q.direct?.eventHistorySize       ?: "unknown",
-            stateHistorySize      : q.direct?.stateHistorySize       ?: "unknown",
-            tooManyEventsThreshold: q.direct?.tooManyEventsThreshold ?: "unknown"
-        ]
+        scanPartialResults[q.id as String] ?: fallbackRow(q)
     }
 
     try {
@@ -256,18 +232,17 @@ private void finalizeScan(String scanId) {
 
 // Safety net in case the async chain stalls (hub restart, HTTP failure, etc.)
 void finalizeScanTimeout() {
-    if (!currentScanId) return
+    if (!currentScanId) {
+        // Hub restarted mid-scan: the @Field static is gone but persisted state flags
+        // may still be set, which would blank the report section indefinitely.
+        state.scanStatus     = null
+        state.scanInProgress = false
+        return
+    }
     log.warn "Device Status Checker: scan timed out after ${SCAN_TIMEOUT_SECS}s — saving partial results"
 
     List<Map> rows = scanDeviceQueue.collect { Map q ->
-        scanPartialResults[q.id as String] ?: [
-            id: q.id ?: "unknown", name: q.name ?: "unknown", type: q.type ?: "unknown",
-            disabled: q.disabled, meshEnabled: null, meshAvailable: null,
-            retryEnabled: null, retryAvailable: null, loggingSettings: [],
-            eventHistorySize      : q.direct?.eventHistorySize       ?: "unknown",
-            stateHistorySize      : q.direct?.stateHistorySize       ?: "unknown",
-            tooManyEventsThreshold: q.direct?.tooManyEventsThreshold ?: "unknown"
-        ]
+        scanPartialResults[q.id as String] ?: fallbackRow(q)
     }
     try {
         state.scanRowsJson     = groovy.json.JsonOutput.toJson(rows)
@@ -377,26 +352,19 @@ private String buildPrintHtml() {
     }
     sb << "</tr></thead><tbody>"
     rows.each { Map r ->
-        String dis = safeString(r.disabled)
-        String disFmt = (dis == "Yes") ? "<span style='color:red;font-weight:bold'>Yes</span>"
-                                       : "<span style='color:green'>No</span>"
-        String meshFmt  = (r.meshAvailable  == true) ? ((r.meshEnabled  == true) ? "<span style='color:green;font-weight:bold'>On</span>"  : "Off") : "—"
-        String retryFmt = (r.retryAvailable == true) ? ((r.retryEnabled == true) ? "<span style='color:green;font-weight:bold'>On</span>"  : "Off") : "—"
+        boolean isDisabled = (safeString(r.disabled) == "Yes")
+        List<Map> rls = (r.loggingSettings instanceof List) ? (List<Map>) r.loggingSettings : []
         sb << "<tr>"
         sb << "<td class='c'>${htmlEscape(safeString(r.id))}</td>"
         sb << "<td>${htmlEscape(safeString(r.name))}</td>"
         sb << "<td>${htmlEscape(safeString(r.type))}</td>"
-        sb << "<td class='c'>${disFmt}</td>"
-        sb << "<td class='c'>${meshFmt}</td>"
-        sb << "<td class='c'>${retryFmt}</td>"
+        sb << "<td class='c'>${fmtDisabled(isDisabled)}</td>"
+        sb << "<td class='c'>${fmtToggle(r.meshAvailable  as Boolean, r.meshEnabled  as Boolean)}</td>"
+        sb << "<td class='c'>${fmtToggle(r.retryAvailable as Boolean, r.retryEnabled as Boolean)}</td>"
         sb << "<td class='c'>${htmlEscape(safeString(r.eventHistorySize))}</td>"
         sb << "<td class='c'>${htmlEscape(safeString(r.stateHistorySize))}</td>"
         sb << "<td class='c'>${htmlEscape(safeString(r.tooManyEventsThreshold))}</td>"
-        List<Map> rls = (r.loggingSettings instanceof List) ? (List<Map>) r.loggingSettings : []
-        String rLogFmt = rls.isEmpty() ? "—" : rls.collect { Map ls ->
-            "${htmlEscape(safeString(ls.name as String))} ${ls.enabled == true ? '✓' : '✗'}"
-        }.join("<br>")
-        sb << "<td>${rLogFmt}</td>"
+        sb << "<td>${fmtLogPlain(rls)}</td>"
         sb << "</tr>"
     }
     sb << "</tbody></table>"
@@ -484,7 +452,7 @@ def mainPage() {
         }
 
         section("") {
-            paragraph buildReportHtml()
+            paragraph buildReportHtml(devCount)
         }
 
         section("Controls", hideable: true, hidden: true) {
@@ -545,6 +513,12 @@ def mainPage() {
                 "<b>Disabled toggle</b><br>" +
                 "Click any cell in the Disabled column to toggle that device's disabled state. " +
                 "Uses Hubitat's internal <code>/device/disable</code> endpoint.<br><br>" +
+                "<b>Hub Mesh and Command Retry toggles</b><br>" +
+                "Click any cell in the Hub Mesh or Command Retry columns to toggle that setting. " +
+                "Uses a read-then-write pattern: the current device record and version are fetched " +
+                "from <code>/device/fullJson/{id}</code> first, then the full record is re-submitted " +
+                "to <code>/device/update</code> with only the changed field updated. Cells showing — " +
+                "indicate the device does not support that feature.<br><br>" +
                 "<b>Column hide buttons</b><br>" +
                 "The Hide columns bar above the table persists across page reloads using browser " +
                 "localStorage. Each button toggles visibility of its column; a strikethrough " +
@@ -572,10 +546,8 @@ def mainPage() {
  * Report generation
  * -------------------------------------------------------------------------- */
 
-private String buildReportHtml() {
-    List devs = normalizeDeviceList(selectedDevices)
-
-    if (!devs) {
+private String buildReportHtml(int devCount) {
+    if (!devCount) {
         return "<p>Select one or more devices above.</p>"
     }
 
@@ -585,7 +557,7 @@ private String buildReportHtml() {
         return buildTableHtml(rows, state.lastScan ?: "unknown", state.lastScanDuration ?: "")
     }
 
-    if (state.scanInProgress) return ""   // "Scan started" in button section is enough
+    if (currentScanId) return ""   // "Scan started" in button section is enough
 
     return "<p>No scan results yet. Click <b>Scan Devices</b> above to run the first scan.</p>"
 }
@@ -607,25 +579,25 @@ private String buildTableHtml(List<Map> rows, String lastScan, String duration) 
     sb << "</div>"
 
     // ── Column hide toggle bar + row filter + name filter ─────────────────────
-    sb << "<div class='rmcol-toggle-bar'>"
+    sb << "<div class='dsc-toggle-bar'>"
     sb << "<b>Hide rows:</b>&nbsp;"
-    sb << "<span id='dsc-toggle-row-disabled' class='rmcol-btn' data-pref-key='dsc-rowfilt-disabled' onclick='dscToggleRowFilter(this)'>Disabled devices</span>"
+    sb << "<span id='dsc-toggle-row-disabled' class='dsc-btn' data-pref-key='dsc-rowfilt-disabled' onclick='dscToggleRowFilter(this)'>Disabled devices</span>"
     sb << "&nbsp;&nbsp;<b>Hide columns:</b>&nbsp;"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-devid'     data-col-class='dsc-col-devid'     onclick=\"dscToggleCol('dsc-col-devid',this)\">Device ID</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-disabled'  data-col-class='dsc-col-disabled'  onclick=\"dscToggleCol('dsc-col-disabled',this)\">Disabled</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-devtype'   data-col-class='dsc-col-devtype'   onclick=\"dscToggleCol('dsc-col-devtype',this)\">Device Type</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-evtsize'   data-col-class='dsc-col-evtsize'   onclick=\"dscToggleCol('dsc-col-evtsize',this)\">Event Hist Size</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-statesize' data-col-class='dsc-col-statesize' onclick=\"dscToggleCol('dsc-col-statesize',this)\">State Hist Size</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-threshold' data-col-class='dsc-col-threshold' onclick=\"dscToggleCol('dsc-col-threshold',this)\">Alert Threshold</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-mesh'      data-col-class='dsc-col-mesh'      onclick=\"dscToggleCol('dsc-col-mesh',this)\">Hub Mesh</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-retry'     data-col-class='dsc-col-retry'     onclick=\"dscToggleCol('dsc-col-retry',this)\">Cmd Retry</span>"
-    sb << "<span class='rmcol-btn' data-pref-key='dsc-logging'   data-col-class='dsc-col-logging'   onclick=\"dscToggleCol('dsc-col-logging',this)\">Logging</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-devid'     data-col-class='dsc-col-devid'     onclick=\"dscToggleCol('dsc-col-devid',this)\">Device ID</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-disabled'  data-col-class='dsc-col-disabled'  onclick=\"dscToggleCol('dsc-col-disabled',this)\">Disabled</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-devtype'   data-col-class='dsc-col-devtype'   onclick=\"dscToggleCol('dsc-col-devtype',this)\">Device Type</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-evtsize'   data-col-class='dsc-col-evtsize'   onclick=\"dscToggleCol('dsc-col-evtsize',this)\">Event Hist Size</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-statesize' data-col-class='dsc-col-statesize' onclick=\"dscToggleCol('dsc-col-statesize',this)\">State Hist Size</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-threshold' data-col-class='dsc-col-threshold' onclick=\"dscToggleCol('dsc-col-threshold',this)\">Alert Threshold</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-mesh'      data-col-class='dsc-col-mesh'      onclick=\"dscToggleCol('dsc-col-mesh',this)\">Hub Mesh</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-retry'     data-col-class='dsc-col-retry'     onclick=\"dscToggleCol('dsc-col-retry',this)\">Cmd Retry</span>"
+    sb << "<span class='dsc-btn' data-pref-key='dsc-logging'   data-col-class='dsc-col-logging'   onclick=\"dscToggleCol('dsc-col-logging',this)\">Logging</span>"
     sb << "&nbsp;&nbsp;<b>Filter:</b>&nbsp;"
-    sb << "<input id='dsc-name-filter' type='text' class='rmname-filter' placeholder='Name (* and ? wildcards)' oninput='applyDscRowFilters()' style='width:230px;'>"
+    sb << "<input id='dsc-name-filter' type='text' class='dsc-name-filter' placeholder='Name (* and ? wildcards)' oninput='applyDscRowFilters()' style='width:230px;'>"
     sb << "</div>"
 
     // ── Table ─────────────────────────────────────────────────────────────────
-    sb << "<table id='dsc_table' class='rmlogcheck'><thead><tr>"
+    sb << "<table id='dsc_table' class='dsc-table'><thead><tr>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',0)\" class='center dsc-col-devid'>Device ID</th>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',1)\" class='sort-asc'>Device Label</th>"
     sb << "<th onclick=\"sortRmLogTable('dsc_table',2)\" class='dsc-col-devtype'>Device Type</th>"
@@ -646,9 +618,6 @@ private String buildTableHtml(List<Map> rows, String lastScan, String duration) 
         String stateSize   = htmlEscape(safeString(r.stateHistorySize))
         String threshold   = htmlEscape(safeString(r.tooManyEventsThreshold))
         boolean isDisabled = (r.disabled == "Yes")
-        String disabledFmt = isDisabled
-            ? "<span style='color:red;font-weight:bold;'>Yes</span>"
-            : "<span style='color:green;font-weight:bold;'>No</span>"
 
         // Build device label cell with link
         String sid = safeString(r.id)
@@ -664,28 +633,22 @@ private String buildTableHtml(List<Map> rows, String lastScan, String duration) 
         sb << "<td class='center dsc-col-devid' data-sort='${id}'>${id}</td>"
         sb << "<td data-sort='${nameEsc}'>${nameLinkHtml}</td>"
         sb << "<td class='dsc-col-devtype' data-sort='${typeEsc}'>${typeEsc}</td>"
-        sb << "<td class='center rmlog-clickable dsc-col-disabled' data-sort='${isDisabled ? "1" : "0"}' data-device-id='${id}' data-on='${isDisabled}' onclick='devToggleDisabled(this)'>${disabledFmt}</td>"
+        sb << "<td class='center dsc-clickable dsc-col-disabled' data-sort='${isDisabled ? "1" : "0"}' data-device-id='${id}' data-on='${isDisabled}' onclick='devToggleDisabled(this)'>${fmtDisabled(isDisabled)}</td>"
 
         // Hub Mesh cell
         if (r.meshAvailable == true) {
             boolean meshOn = (r.meshEnabled == true)
-            String meshFmt = meshOn
-                ? "<span style='color:green;font-weight:bold;'>On</span>"
-                : "<span style='color:#888;'>Off</span>"
-            sb << "<td class='center dsc-col-mesh rmlog-clickable' data-sort='${meshOn ? "1" : "0"}' data-device-id='${id}' data-field='meshEnabled' data-on='${meshOn}' onclick='devToggleDeviceProp(this)'>${meshFmt}</td>"
+            sb << "<td class='center dsc-col-mesh dsc-clickable' data-sort='${meshOn ? "1" : "0"}' data-device-id='${id}' data-field='meshEnabled' data-on='${meshOn}' onclick='devToggleDeviceProp(this)'>${fmtToggle(true, meshOn)}</td>"
         } else {
-            sb << "<td class='center dsc-col-mesh' data-sort=''><span style='color:#bbb;'>—</span></td>"
+            sb << "<td class='center dsc-col-mesh' data-sort=''>${fmtToggle(false, null)}</td>"
         }
 
         // Command Retry cell
         if (r.retryAvailable == true) {
             boolean retryOn = (r.retryEnabled == true)
-            String retryFmt = retryOn
-                ? "<span style='color:green;font-weight:bold;'>On</span>"
-                : "<span style='color:#888;'>Off</span>"
-            sb << "<td class='center dsc-col-retry rmlog-clickable' data-sort='${retryOn ? "1" : "0"}' data-device-id='${id}' data-field='retryEnabled' data-on='${retryOn}' onclick='devToggleDeviceProp(this)'>${retryFmt}</td>"
+            sb << "<td class='center dsc-col-retry dsc-clickable' data-sort='${retryOn ? "1" : "0"}' data-device-id='${id}' data-field='retryEnabled' data-on='${retryOn}' onclick='devToggleDeviceProp(this)'>${fmtToggle(true, retryOn)}</td>"
         } else {
-            sb << "<td class='center dsc-col-retry' data-sort=''><span style='color:#bbb;'>—</span></td>"
+            sb << "<td class='center dsc-col-retry' data-sort=''>${fmtToggle(false, null)}</td>"
         }
         sb << "<td class='center dsc-col-evtsize'   data-sort='${evtSize}'>${evtSize}</td>"
         sb << "<td class='center dsc-col-statesize' data-sort='${stateSize}'>${stateSize}</td>"
@@ -693,18 +656,8 @@ private String buildTableHtml(List<Map> rows, String lastScan, String duration) 
 
         // Logging settings cell
         List<Map> logSettings = (r.loggingSettings instanceof List) ? (List<Map>) r.loggingSettings : []
-        if (logSettings.isEmpty()) {
-            sb << "<td class='dsc-col-logging' data-sort=''><span style='color:#bbb;'>—</span></td>"
-        } else {
-            int enabledCount = logSettings.count { it.enabled == true } as int
-            List<String> parts = logSettings.collect { Map ls ->
-                boolean on = (ls.enabled == true)
-                String col = on ? "color:green;" : "color:#888;"
-                String sym = on ? "✓" : "✗"
-                "<span style='font-size:0.88em;${col}'>${htmlEscape(safeString(ls.name as String))} ${sym}</span>"
-            }
-            sb << "<td class='dsc-col-logging' data-sort='${enabledCount}'>${parts.join('<br>')}</td>"
-        }
+        int enabledCount = logSettings.count { it.enabled == true } as int
+        sb << "<td class='dsc-col-logging' data-sort='${logSettings ? enabledCount : ""}'>${fmtLogHtml(logSettings)}</td>"
         sb << "</tr>"
     }
 
@@ -726,21 +679,21 @@ private String buildDeviceReportCssJs() {
 
     // ── CSS — mirrors Rule Logging Status Checker styling ─────────────────────
     sb << "<style>"
-    sb << "table.rmlogcheck{border-collapse:collapse;width:100%;}"
-    sb << "table.rmlogcheck th,table.rmlogcheck td{border:1px solid #ccc;padding:4px 7px;text-align:left;vertical-align:middle;}"
-    sb << "table.rmlogcheck th{background-color:#FFD700;color:#000;cursor:pointer;font-weight:bold;user-select:none;white-space:nowrap;}"
-    sb << "table.rmlogcheck th:hover{background-color:#FFC700;}"
-    sb << "table.rmlogcheck th.sort-asc::after{content:' ▲';font-size:0.8em;}"
-    sb << "table.rmlogcheck th.sort-desc::after{content:' ▼';font-size:0.8em;}"
-    sb << "table.rmlogcheck td.center,table.rmlogcheck th.center{text-align:center;}"
-    sb << ".rmcol-toggle-bar{margin-bottom:8px;font-size:0.9em;}"
-    sb << ".rmcol-btn{display:inline-block;cursor:pointer;padding:2px 8px;margin-right:6px;"
+    sb << "table.dsc-table{border-collapse:collapse;width:100%;}"
+    sb << "table.dsc-table th,table.dsc-table td{border:1px solid #ccc;padding:4px 7px;text-align:left;vertical-align:middle;}"
+    sb << "table.dsc-table th{background-color:#FFD700;color:#000;cursor:pointer;font-weight:bold;user-select:none;white-space:nowrap;}"
+    sb << "table.dsc-table th:hover{background-color:#FFC700;}"
+    sb << "table.dsc-table th.sort-asc::after{content:' ▲';font-size:0.8em;}"
+    sb << "table.dsc-table th.sort-desc::after{content:' ▼';font-size:0.8em;}"
+    sb << "table.dsc-table td.center,table.dsc-table th.center{text-align:center;}"
+    sb << ".dsc-toggle-bar{margin-bottom:8px;font-size:0.9em;}"
+    sb << ".dsc-btn{display:inline-block;cursor:pointer;padding:2px 8px;margin-right:6px;"
     sb << "border:1px solid #aaa;border-radius:3px;background:#e8e8e8;user-select:none;}"
-    sb << ".rmcol-btn.hidden-col{text-decoration:line-through;opacity:0.45;background:#ccc;}"
-    sb << "table.rmlogcheck td.rmlog-clickable{cursor:pointer;}"
-    sb << "table.rmlogcheck td.rmlog-clickable:hover{filter:brightness(0.82);}"
-    sb << "table.rmlogcheck td.rmlog-toggling{opacity:0.45;cursor:wait;pointer-events:none;}"
-    sb << ".rmname-filter{padding:2px 6px;font-size:0.9em;border:1px solid #aaa;border-radius:3px;vertical-align:middle;}"
+    sb << ".dsc-btn.hidden-col{text-decoration:line-through;opacity:0.45;background:#ccc;}"
+    sb << "table.dsc-table td.dsc-clickable{cursor:pointer;}"
+    sb << "table.dsc-table td.dsc-clickable:hover{filter:brightness(0.82);}"
+    sb << "table.dsc-table td.dsc-toggling{opacity:0.45;cursor:wait;pointer-events:none;}"
+    sb << ".dsc-name-filter{padding:2px 6px;font-size:0.9em;border:1px solid #aaa;border-radius:3px;vertical-align:middle;}"
     sb << "</style>"
 
     // ── JavaScript ────────────────────────────────────────────────────────────
@@ -854,8 +807,8 @@ function dscLoadPrefs() {
 async function devToggleDisabled(td) {
     if (td.dataset.toggling) return;
     td.dataset.toggling = '1';
-    td.classList.remove('rmlog-clickable');
-    td.classList.add('rmlog-toggling');
+    td.classList.remove('dsc-clickable');
+    td.classList.add('dsc-toggling');
     var deviceId = td.dataset.deviceId;
     var newOn = (td.dataset.on !== 'true');
     try {
@@ -880,8 +833,8 @@ async function devToggleDisabled(td) {
         alert('Toggle disabled failed: ' + e.message);
     } finally {
         delete td.dataset.toggling;
-        td.classList.remove('rmlog-toggling');
-        td.classList.add('rmlog-clickable');
+        td.classList.remove('dsc-toggling');
+        td.classList.add('dsc-clickable');
     }
 }
 
@@ -893,8 +846,8 @@ async function devToggleDisabled(td) {
 async function devToggleDeviceProp(td) {
     if (td.dataset.toggling) return;
     td.dataset.toggling = '1';
-    td.classList.remove('rmlog-clickable');
-    td.classList.add('rmlog-toggling');
+    td.classList.remove('dsc-clickable');
+    td.classList.add('dsc-toggling');
     var deviceId  = td.dataset.deviceId;
     var fieldName = td.dataset.field;   // 'meshEnabled' or 'retryEnabled'
     var newOn     = (td.dataset.on !== 'true');
@@ -952,69 +905,13 @@ async function devToggleDeviceProp(td) {
         alert('Toggle failed: ' + e.message);
     } finally {
         delete td.dataset.toggling;
-        td.classList.remove('rmlog-toggling');
-        td.classList.add('rmlog-clickable');
+        td.classList.remove('dsc-toggling');
+        td.classList.add('dsc-clickable');
     }
 }
 </script>'''
 
     return sb.toString()
-}
-
-/* --------------------------------------------------------------------------
- * Device audit
- * -------------------------------------------------------------------------- */
-
-private Map auditDevice(dev) {
-    String id       = safeString(getDeviceId(dev))
-    String name     = safeString(getDeviceName(dev))
-    String type     = safeString(getDeviceType(dev))
-    String disabled = getDisabledStatus(dev)
-
-    Map direct      = getRetentionValuesDirectly(dev)
-    Map jsonValues  = [:]
-
-    // Always fetch fullJson — needed for Hub Mesh, Command Retry, and retention
-    // values that aren't exposed via the DeviceWrapper directly.
-    if (id) {
-        Map jsonResult = fetchDeviceFullJson(id)
-        if (jsonResult.ok) {
-            jsonValues = jsonResult.values ?: [:]
-        } else if (debugEnable) {
-            log.debug "auditDevice: fetchDeviceFullJson failed for device ${id} — ${jsonResult.error ?: 'unknown error'}"
-        }
-    }
-
-    Object eventSize  = firstUseful(direct.eventHistorySize,       jsonValues.eventHistorySize,       "unknown")
-    Object stateSize  = firstUseful(direct.stateHistorySize,       jsonValues.stateHistorySize,       "unknown")
-    Object threshold  = firstUseful(direct.tooManyEventsThreshold, jsonValues.tooManyEventsThreshold, "unknown")
-
-    return [
-        id                     : id       ?: "unknown",
-        name                   : name     ?: "unknown",
-        type                   : type     ?: "unknown",
-        disabled               : disabled,
-        meshEnabled            : jsonValues.meshEnabled,           // Boolean or null
-        meshAvailable          : jsonValues.meshSelectionEnabled,  // Boolean or null
-        retryEnabled           : jsonValues.retryEnabled,          // Boolean or null
-        retryAvailable         : jsonValues.retryAvailable,        // Boolean or null
-        loggingSettings        : jsonValues.loggingSettings ?: [],  // List<Map> of {name, enabled}
-        eventHistorySize       : eventSize,
-        stateHistorySize       : stateSize,
-        tooManyEventsThreshold : threshold
-    ]
-}
-
-private boolean valuesNeedLookup(Map values) {
-    return isBlankValue(values?.eventHistorySize) ||
-           isBlankValue(values?.stateHistorySize) ||
-           isBlankValue(values?.tooManyEventsThreshold)
-}
-
-private boolean hasAnyLookupValue(Map values) {
-    return !isBlankValue(values?.eventHistorySize) ||
-           !isBlankValue(values?.stateHistorySize) ||
-           !isBlankValue(values?.tooManyEventsThreshold)
 }
 
 /* --------------------------------------------------------------------------
@@ -1177,56 +1074,6 @@ private Object tryProperty(Object obj, String propName) {
 /* --------------------------------------------------------------------------
  * Device JSON endpoint probing
  * -------------------------------------------------------------------------- */
-
-private Map fetchDeviceFullJson(String deviceId) {
-    Map out = [
-        ok: false,
-        hasValues: false,
-        status: null,
-        error: null,
-        values: [:]
-    ]
-
-    try {
-        httpGet([
-            uri: HUB_BASE_URL,
-            path: "/device/fullJson/${deviceId}",
-            timeout: 15,
-            contentType: "application/json"
-        ]) { resp ->
-            out.status = resp?.status
-
-            if (resp?.status == 200) {
-                Object data = resp?.data
-
-                if (data instanceof String) {
-                    try {
-                        data = new groovy.json.JsonSlurper().parseText(data as String)
-                    } catch (Throwable parseError) {
-                        out.error = "JSON parse failed: ${parseError.message}"
-                    }
-                }
-
-                if (data != null) {
-                    Map values = parseDeviceFullJson(data)
-                    out.ok        = true
-                    out.values    = values
-                    out.hasValues = hasAnyLookupValue(values)
-                    if (debugEnable) {
-                        log.debug "fetchDeviceFullJson: device ${deviceId} — eventHistorySize=${values.eventHistorySize}, stateHistorySize=${values.stateHistorySize}, tooManyEventsThreshold=${values.tooManyEventsThreshold}"
-                    }
-                }
-            }
-        }
-    } catch (Throwable e) {
-        out.error = e?.message ?: e.toString()
-        if (debugEnable) {
-            log.debug "fetchDeviceFullJson: device ${deviceId} — caught exception: ${out.error}"
-        }
-    }
-
-    return out
-}
 
 private Map parseDeviceFullJson(Object jsonData) {
     Map result = [
@@ -1469,6 +1316,49 @@ private boolean keyLooksLikeTooManyEventsThreshold(String keyNorm) {
     boolean eventish     = keyNorm.contains("event")     || keyNorm.contains("events") || keyNorm.contains("alert")  || keyNorm.contains("excess") || keyNorm.contains("spammy")
 
     return thresholdish && eventish
+}
+
+/* --------------------------------------------------------------------------
+ * Cell-formatting helpers — shared by buildTableHtml() and buildPrintHtml()
+ * -------------------------------------------------------------------------- */
+
+/** Renders the Disabled column value as a coloured Yes/No span. */
+private String fmtDisabled(boolean isDisabled) {
+    isDisabled ? "<span style='color:red;font-weight:bold;'>Yes</span>"
+               : "<span style='color:green;font-weight:bold;'>No</span>"
+}
+
+/**
+ * Renders Hub Mesh / Command Retry column content.
+ * Returns an On/Off span when the feature is available, or a greyed dash when it isn't.
+ */
+private String fmtToggle(Boolean available, Boolean enabled) {
+    if (available != true) return "<span style='color:#bbb;'>—</span>"
+    (enabled == true) ? "<span style='color:green;font-weight:bold;'>On</span>"
+                      : "<span style='color:#888;'>Off</span>"
+}
+
+/**
+ * Renders the Logging column for the interactive table — each preference on its own
+ * line with colour and a check/cross glyph.
+ */
+private String fmtLogHtml(List<Map> logSettings) {
+    if (!logSettings) return "<span style='color:#bbb;'>—</span>"
+    logSettings.collect { Map ls ->
+        boolean on = (ls.enabled == true)
+        "<span style='font-size:0.88em;${on ? 'color:green;' : 'color:#888;'}'>" +
+            "${htmlEscape(safeString(ls.name as String))} ${on ? '✓' : '✗'}</span>"
+    }.join('<br>')
+}
+
+/**
+ * Renders the Logging column for the printable report — plain text, no colour spans.
+ */
+private String fmtLogPlain(List<Map> logSettings) {
+    if (!logSettings) return "—"
+    logSettings.collect { Map ls ->
+        "${htmlEscape(safeString(ls.name as String))} ${ls.enabled == true ? '✓' : '✗'}"
+    }.join('<br>')
 }
 
 /* --------------------------------------------------------------------------
