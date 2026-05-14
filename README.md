@@ -8,7 +8,7 @@ A Hubitat app that audits selected devices and presents their key settings in a 
 
 ## Installation
 
-1. In Hubitat, go to **Apps Code → + New App** and paste in the contents of `Device_Status_Checker_1_13.groovy`.
+1. In Hubitat, go to **Apps Code → + New App** and paste in the contents of `Device_Status_Checker_1_21.groovy`.
 2. Save. OAuth will be enabled automatically on first use.
 3. Go to **Apps → + Add User App** and select **Device Status Checker**.
 4. Expand the **Device Selection** section and choose the devices you want to audit.
@@ -48,8 +48,8 @@ The **Hide columns** bar above the table allows individual columns to be shown o
 ### In-place toggles
 Cells in the **Disabled**, **Hub Mesh**, and **Command Retry** columns are clickable to toggle the setting directly without leaving the app. The Disabled toggle calls Hubitat's internal `/device/disable` endpoint. The Hub Mesh and Command Retry toggles use a read-then-write pattern: the current device state and version are fetched from `/device/fullJson/{id}` first, then the full device record is re-submitted to `/device/update` with only the changed field updated.
 
-### Rescan
-Click **Rescan Devices** to re-run the audit immediately. The report is also rebuilt automatically whenever the page is opened or the device list is changed. The scan duration is shown next to the Last scan timestamp.
+### Scan
+Click **Scan Devices** to run or re-run the audit. Opening the app does not trigger a new scan — cached results from the previous scan are shown immediately. A "Scan started" status line appears under the button while scanning; the page polls every 5 seconds and updates automatically when the scan completes. The scan duration is shown next to the Last scan timestamp.
 
 ### Printable report and CSV export
 After the first scan, links appear in the **Controls** section:
@@ -93,7 +93,15 @@ This app uses several Hubitat internal endpoints that are not part of a formal p
 
 | Version | Changes |
 |---|---|
-| 1.13 | Device Name column renamed to Device Label; `getDeviceName()` now resolves the user-assigned label first, falling back to display name then driver name. Hide Disabled column button added to the column-hide bar |
+| 1.21 | Code cleanup: removed orphaned synchronous scan path; extracted `fallbackRow()` helper and cell-formatting helpers (`fmtDisabled`, `fmtToggle`, `fmtLogHtml`, `fmtLogPlain`); fixed hub-restart safety bug in scan timeout; renamed CSS classes from `rm-` to `dsc-` prefix |
+| 1.20 | Fixed duplicate scan messages; cached results stay visible during a rescan |
+| 1.19 | Async scan via `asynchttpGet` chain; "Scan started" status line; 5-minute timeout safety net saves partial results |
+| 1.18 | Fixed persistent "Scan started" message |
+| 1.17 | Reverted async scan (runIn broke hub HTTP calls); synchronous scan with reliable status message |
+| 1.16 | Device count shown in Device Selection section header; page polls every 5 s while scan is in progress |
+| 1.15 | Scan status line ("Scan started: timestamp — scanning N devices…") shown under Scan button while scanning |
+| 1.14 | On-demand scan: opening the app shows cached results immediately; button renamed to **Scan Devices**; scan only runs on button click |
+| 1.13 | Device Name column renamed to **Device Label**; `getDeviceName()` resolves user-assigned label first, falling back to display name then driver name. Hide Disabled column button added to the column-hide bar |
 | 1.12 | Logging column: reads driver bool preferences from `settings[]` in `/device/fullJson`; shows each as name ✓/✗; sorts by count of enabled prefs |
 | 1.11 | Hub Mesh and Command Retry columns with in-place toggle via `POST /device/update` |
 | 1.10 | App instance name field; printable HTML report and CSV export via OAuth endpoints |
