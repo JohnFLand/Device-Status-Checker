@@ -42,16 +42,16 @@ import groovy.transform.Field
 @Field static volatile Long    scanStartMs        = 0L
 
 definition(
-    name:        "Device Status Checker 1.21",
-    namespace:   "John Land",
-    author:      "John Land & AI",
-    description: "Report for selected devices for disabled status and history retention settings.",
-    category:    "Convenience",
-    iconUrl:     '',
-    iconX2Url:   '',
-    importUrl: "https://raw.githubusercontent.com/JohnFLand/Device-Status-Checker/refs/heads/main/Device_Status_Checker.groovy",
+    name:           "Device Status Checker 1.23",
+    namespace:      "John Land",
+    author:         "John Land & AI",
+    description:    "Report for selected devices for disabled status and history retention settings.",
+    category:       "Convenience",
+    iconUrl:        '',
+    iconX2Url:      '',
     singleInstance: true,
-    oauth:          true
+    oauth:          true,
+    importUrl:      "https://raw.githubusercontent.com/JohnFLand/Device-Status-Checker/refs/heads/main/Device_Status_Checker.groovy"
 )
 
 preferences {
@@ -505,9 +505,10 @@ def mainPage() {
                 "These links use Hubitat's OAuth API and are self-enabling; if setup fails the " +
                 "app will prompt you to enable OAuth manually in Apps Code.<br><br>" +
                 "<b>Filter and hide rows</b><br>" +
-                "The <b>Filter</b> field accepts wildcard patterns: <b>*</b> matches any sequence " +
-                "of characters, <b>?</b> matches any single character (e.g. <code>*Motion*</code>). " +
-                "Filtering is case-insensitive. The <b>Disabled devices</b> row button hides all " +
+                "The <b>Filter</b> field accepts plain text for case-insensitive substring matching, " +
+                "so partial searches do not require wildcards. Optional wildcard patterns are also supported: " +
+                "<b>*</b> matches any sequence of characters and <b>?</b> matches any single character " +
+                "(e.g. <code>*Motion*</code>). The <b>Disabled devices</b> row button hides all " +
                 "rows where Disabled is Yes; click it again to show them. Both filters apply " +
                 "together — a row must pass both to be visible.<br><br>" +
                 "<b>Disabled toggle</b><br>" +
@@ -593,7 +594,7 @@ private String buildTableHtml(List<Map> rows, String lastScan, String duration) 
     sb << "<span class='dsc-btn' data-pref-key='dsc-retry'     data-col-class='dsc-col-retry'     onclick=\"dscToggleCol('dsc-col-retry',this)\">Cmd Retry</span>"
     sb << "<span class='dsc-btn' data-pref-key='dsc-logging'   data-col-class='dsc-col-logging'   onclick=\"dscToggleCol('dsc-col-logging',this)\">Logging</span>"
     sb << "&nbsp;&nbsp;<b>Filter:</b>&nbsp;"
-    sb << "<input id='dsc-name-filter' type='text' class='dsc-name-filter' placeholder='Name (* and ? wildcards)' oninput='applyDscRowFilters()' style='width:230px;'>"
+    sb << "<input id='dsc-name-filter' type='text' class='dsc-name-filter' placeholder='Name (substring or * ? wildcards)' oninput='applyDscRowFilters()' style='width:280px;'>"
     sb << "</div>"
 
     // ── Table ─────────────────────────────────────────────────────────────────
@@ -737,8 +738,9 @@ function dscToggleCol(cls, btn) {
     try { localStorage.setItem('dsc_pref_' + btn.dataset.prefKey, String(hiding)); } catch(e) {}
 }
 
-// ── Wildcard name filter ──────────────────────────────────────────────────────
+// ── Name filter ──────────────────────────────────────────────────────────────
 // Convert a wildcard pattern (* = any chars, ? = any single char) to a RegExp.
+// Plain filter text is handled separately as a case-insensitive substring match.
 function wildcardToRegex(pattern) {
     var result = '';
     for (var i = 0; i < pattern.length; i++) {
@@ -758,15 +760,24 @@ function applyDscRowFilters() {
     var filterEl = document.getElementById('dsc-name-filter');
     var filterVal = filterEl ? filterEl.value.trim() : '';
     var filterRe = null;
+    var hasWild  = filterVal.indexOf('*') >= 0 || filterVal.indexOf('?') >= 0;
+    var lowerSub = '';
     if (filterVal) {
-        try { filterRe = wildcardToRegex(filterVal); } catch(e) { filterRe = null; }
+        if (hasWild) {
+            // Wildcard pattern — full-string match with * and ? expansion.
+            try { filterRe = wildcardToRegex(filterVal); } catch(e) { filterRe = null; }
+        } else {
+            // Plain text — case-insensitive substring match; no wildcards needed.
+            lowerSub = filterVal.toLowerCase();
+        }
     }
     document.querySelectorAll('#dsc_table tbody tr').forEach(function(tr) {
         var hide = hideDisabled && tr.classList.contains('dsc-row-disabled');
-        if (!hide && filterRe) {
+        if (!hide && filterVal) {
             var nameCell = tr.querySelectorAll('td')[1];
             var nm = nameCell ? (nameCell.getAttribute('data-sort') || nameCell.textContent || '').trim() : '';
-            if (!filterRe.test(nm)) hide = true;
+            if      (filterRe) { hide = !filterRe.test(nm); }
+            else if (lowerSub) { hide = nm.toLowerCase().indexOf(lowerSub) < 0; }
         }
         tr.style.display = hide ? 'none' : '';
     });
@@ -812,12 +823,52 @@ async function devToggleDisabled(td) {
     var deviceId = td.dataset.deviceId;
     var newOn = (td.dataset.on !== 'true');
     try {
-        var resp = await fetch('/device/disable', {
-            method: 'POST',
+        // Step 1 — read current state + version
+        // /device/disable returns HTTP 500; use the same read-then-write pattern
+        // as devToggleDeviceProp — disabled is just another device property.
+        var jr = await fetch('/device/fullJson/' + deviceId);
+        if (!jr.ok) throw new Error('fullJson HTTP ' + jr.status);
+        var data = await jr.json();
+        var dev = data.device;
+        if (!dev) throw new Error('No device object in fullJson');
+
+        // Step 2 — build full re-POST body (Hubitat requires all device fields)
+        var bv = function(v) { return v ? 'on' : 'false'; };
+        var fd = new URLSearchParams();
+        fd.set('id',                     String(dev.id));
+        fd.set('version',                String(dev.version));
+        fd.set('label',                  dev.label                  || dev.displayName || '');
+        fd.set('name',                   dev.name                   || '');
+        fd.set('deviceNetworkId',        dev.deviceNetworkId        || '');
+        fd.set('deviceTypeId',           String(dev.deviceTypeId    || ''));
+        fd.set('deviceTypeReadableType', dev.deviceTypeReadableType || '');
+        fd.set('controllerType',         dev.controllerType         || '');
+        fd.set('hubId',                  String(dev.hubId           != null ? dev.hubId           : 1));
+        fd.set('locationId',             String(dev.locationId      != null ? dev.locationId      : 1));
+        fd.set('groupId',                String(dev.groupId         != null ? dev.groupId         : 0));
+        fd.set('roomId',                 String(dev.roomId          != null ? dev.roomId          : 0));
+        fd.set('maxEvents',              String(dev.maxEvents       != null ? dev.maxEvents       : ''));
+        fd.set('maxStates',              String(dev.maxStates       != null ? dev.maxStates       : ''));
+        fd.set('spammyThreshold',        String(dev.spammyThreshold != null ? dev.spammyThreshold : ''));
+        fd.set('defaultIcon',            dev.defaultIcon            || '');
+        fd.set('notes',                  dev.notes                  || '');
+        fd.set('tags',                   dev.tags                   || '');
+        fd.set('dashboardIds',           '');
+        fd.set('homeKitEnabled',         bv(dev.homeKitEnabled));
+        fd.set('meshFullSync',           bv(dev.meshFullSync));
+        fd.set('meshEnabled',            bv(dev.meshEnabled));
+        fd.set('retryEnabled',           bv(dev.retryEnabled));
+        fd.set('disabled',               bv(newOn));
+        if (dev.zigbeeId) fd.set('zigbeeId', dev.zigbeeId);
+
+        // Step 3 — POST; Hubitat responds with HTTP 302 redirect on success
+        var pr = await fetch('/device/update', {
+            method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ id: deviceId, disable: String(newOn) }).toString()
+            body:    fd.toString()
         });
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        if (!pr.ok) throw new Error('device/update HTTP ' + pr.status);
+
         td.dataset.on = String(newOn);
         td.setAttribute('data-sort', newOn ? '1' : '0');
         td.innerHTML = newOn
